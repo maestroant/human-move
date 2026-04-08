@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mouse Movement Recorder</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #ffffff;
+      --ink: #111111;
+      --muted: #5a5a5a;
+      --accent: #0b57d0;
+      --dot: #d93025;
+      --panel: rgba(255, 255, 255, 0.9);
+      --line: rgba(17, 17, 17, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow: hidden;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    #stage {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 24px 24px;
+      cursor: crosshair;
+    }
+
+    #trail {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .dot {
+      position: absolute;
+      width: 5px;
+      height: 5px;
+      margin-left: -2.5px;
+      margin-top: -2.5px;
+      border-radius: 50%;
+      background: var(--dot);
+      opacity: 0.85;
+    }
+
+    .panel {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 1;
+      max-width: 360px;
+      padding: 14px 16px;
+      border: 1px solid rgba(17, 17, 17, 0.08);
+      border-radius: 12px;
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.07);
+    }
+
+    .panel h1 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .panel p {
+      margin: 0 0 8px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .status {
+      margin-top: 8px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div class="panel">
+      <h1>Mouse Recorder</h1>
+      <p>First click starts recording. Second click stops recording, saves the session, and starts replay.</p>
+      <p>Recorded points are red. Replay is drawn in blue by Playwright.</p>
+      <div class="status" id="status">Status: waiting for first click</div>
+      <div id="stats">Events: 0</div>
+    </div>
+    <div id="trail" aria-hidden="true"></div>
+  </div>
+
+  <script>
+    const stage = document.getElementById("stage");
+    const trail = document.getElementById("trail");
+    const statusNode = document.getElementById("status");
+    const statsNode = document.getElementById("stats");
+
+    let isRecording = false;
+    let sessionStart = 0;
+    let events = [];
+
+    function setStatus(text) {
+      statusNode.textContent = `Status: ${text}`;
+    }
+
+    function updateStats() {
+      statsNode.textContent = `Events: ${events.length}`;
+    }
+
+    function resetTrail() {
+      trail.replaceChildren();
+    }
+
+    function drawDot(x, y) {
+      const dot = document.createElement("div");
+      dot.className = "dot";
+      dot.style.left = `${x}px`;
+      dot.style.top = `${y}px`;
+      trail.append(dot);
+    }
+
+    function buildSessionPayload(endEvent) {
+      return {
+        session_id: crypto.randomUUID(),
+        started_at: new Date(sessionStart).toISOString(),
+        ended_at: new Date(endEvent.timeStamp + performance.timeOrigin).toISOString(),
+        page: {
+          url: window.location.pathname,
+          title: document.title,
+          viewport: {
+            width: window.innerWidth,
+            height: window.innerHeight
+          }
+        },
+        events
+      };
+    }
+
+    async function saveSession(endEvent) {
+      const payload = buildSessionPayload(endEvent);
+      const response = await fetch("/api/sessions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Save failed with status ${response.status}`);
+      }
+
+      return response.json();
+    }
+
+    function startRecording(startEvent) {
+      isRecording = true;
+      sessionStart = startEvent.timeStamp + performance.timeOrigin;
+      events = [];
+      resetTrail();
+      setStatus("recording");
+      updateStats();
+    }
+
+    async function stopRecording(endEvent) {
+      isRecording = false;
+      setStatus("saving");
+
+      try {
+        const result = await saveSession(endEvent);
+        setStatus(`saved ${result.event_count} events`);
+      } catch (error) {
+        console.error(error);
+        setStatus("save failed");
+      }
+    }
+
+    stage.addEventListener("click", (event) => {
+      if (!isRecording) {
+        startRecording(event);
+        return;
+      }
+
+      stopRecording(event);
+    });
+
+    stage.addEventListener("mousemove", (event) => {
+      if (!isRecording) {
+        return;
+      }
+
+      const point = {
+        t: Math.round(event.timeStamp),
+        x: Math.round(event.clientX),
+        y: Math.round(event.clientY)
+      };
+
+      events.push(point);
+      drawDot(point.x, point.y);
+      updateStats();
+    });
+  </script>
+</body>
+</html>
