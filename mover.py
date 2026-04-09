@@ -1,212 +1,169 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import math
+import random
 import time
-from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from playwright.sync_api import Page
-
-
-DEFAULT_SESSIONS_FILE = Path("data/mouse_sessions.jsonl")
-OVERLAY_ROOT_ID = "__human_move_overlay__"
+from playwright.async_api import Page
 
 
-def load_session_line(raw_line: str) -> dict[str, Any]:
-    record = json.loads(raw_line)
-    events = record.get("events")
-    if not isinstance(events, list) or not events:
-        raise ValueError("Session record must contain a non-empty 'events' list.")
-    return record
+def _trim_track(track: list[dict[str, Any]], max_start_pct: float = 0.15, max_end_pct: float = 0.05) -> list[dict[str, Any]]:
+    """
+    Случайным образом обрезает начало (до max_start_pct) и конец (до max_end_pct) трека.
+    """
+    if len(track) < 10:  # Слишком короткие треки лучше не трогать
+        return track
+        
+    start_trim = int(len(track) * random.uniform(0, max_start_pct))
+    end_trim = int(len(track) * random.uniform(0, max_end_pct))
+    
+    if end_trim == 0:
+        return track[start_trim:]
+    return track[start_trim:-end_trim]
 
 
-def load_session_from_file(path: str | Path = DEFAULT_SESSIONS_FILE, line_number: int = -1) -> dict[str, Any]:
-    session_path = Path(path)
-    if not session_path.exists():
-        raise FileNotFoundError(f"Session file not found: {session_path}")
+def _add_noise_to_track(track: list[dict[str, Any]], tremor_amplitude: float = 1.5) -> list[dict[str, Any]]:
+    """
+    Добавляет естественный микротремор к координатам трека.
+    Использует плавное случайное блуждание, чтобы избежать "роботизированных" резких скачков.
+    """
+    if len(track) < 3:
+        return track
 
-    with session_path.open("r", encoding="utf-8") as handle:
-        lines = [line.strip() for line in handle if line.strip()]
-
-    if not lines:
-        raise ValueError(f"No session records found in: {session_path}")
-
-    try:
-        raw_line = lines[line_number]
-    except IndexError as error:
-        raise IndexError(f"Line index {line_number} is out of range for {session_path}") from error
-
-    return load_session_line(raw_line)
-
-
-def get_replay_points(session_record: dict[str, Any]) -> list[dict[str, int]]:
-    normalized_points: list[dict[str, int]] = []
-
-    for event in session_record["events"]:
-        normalized_points.append(
-            {
-                "t": int(event["t"]),
-                "x": int(event["x"]),
-                "y": int(event["y"]),
-            }
-        )
-
-    return normalized_points
+    noisy_track = copy.deepcopy(track)
+    offset_x, offset_y = 0.0, 0.0
+    
+    # Первую и последнюю точки оставляем на месте, чтобы не сбить старт и прицеливание
+    for i in range(1, len(noisy_track) - 1):
+        offset_x += random.gauss(0, tremor_amplitude * 0.25)
+        offset_y += random.gauss(0, tremor_amplitude * 0.25)
+        
+        offset_x = max(-tremor_amplitude, min(tremor_amplitude, offset_x))
+        offset_y = max(-tremor_amplitude, min(tremor_amplitude, offset_y))
+        
+        noisy_track[i]["x"] = int(round(noisy_track[i]["x"] + offset_x))
+        noisy_track[i]["y"] = int(round(noisy_track[i]["y"] + offset_y))
+        
+    return noisy_track
 
 
-def _get_viewport_size(page: Page) -> tuple[int, int]:
+def _rotate_track(track: list[dict[str, Any]], angle_degrees: float | None = None, max_variance: float = 10.0) -> list[dict[str, Any]]:
+    """
+    Поворачивает трек на заданный угол вокруг его начальной точки.
+    Если угол не задан, выбирает случайный угол в диапазоне от -max_variance до +max_variance.
+    """
+    if len(track) < 2:
+        return track
+        
+    rotated = copy.deepcopy(track)
+    ox = rotated[0]["x"]
+    oy = rotated[0]["y"]
+    
+    # Если угол не передан жестко, выбираем случайное отклонение
+    if angle_degrees is None:
+        angle_degrees = random.uniform(-max_variance, max_variance)
+        
+    radians = math.radians(angle_degrees)
+    cos_a = math.cos(radians)
+    sin_a = math.sin(radians)
+    
+    for point in rotated[1:]:
+        dx = point["x"] - ox
+        dy = point["y"] - oy
+        
+        point["x"] = int(round(ox + dx * cos_a - dy * sin_a))
+        point["y"] = int(round(oy + dx * sin_a + dy * cos_a))
+        
+    return rotated
+
+
+async def _get_viewport_size(page: Page) -> tuple[int, int]:
     viewport = page.viewport_size
     if viewport:
         return int(viewport["width"]), int(viewport["height"])
 
-    width = int(page.evaluate("() => window.innerWidth"))
-    height = int(page.evaluate("() => window.innerHeight"))
+    width = int(await page.evaluate("() => window.innerWidth"))
+    height = int(await page.evaluate("() => window.innerHeight"))
     return width, height
 
 
-def _ensure_overlay(page: Page) -> None:
-    page.evaluate(
-        """overlayId => {
-            if (document.getElementById(overlayId)) {
-                return;
-            }
-
-            const root = document.createElement("div");
-            root.id = overlayId;
-            root.innerHTML = `
-              <style>
-                #${overlayId} {
-                  position: fixed;
-                  inset: 0;
-                  pointer-events: none;
-                  z-index: 2147483647;
-                }
-                #${overlayId} .hm-trail {
-                  position: absolute;
-                  inset: 0;
-                }
-                #${overlayId} .hm-dot {
-                  position: absolute;
-                  width: 6px;
-                  height: 6px;
-                  margin-left: -3px;
-                  margin-top: -3px;
-                  border-radius: 999px;
-                  background: rgba(11, 87, 208, 0.35);
-                }
-                #${overlayId} .hm-cursor {
-                  position: absolute;
-                  width: 18px;
-                  height: 18px;
-                  margin-left: -9px;
-                  margin-top: -9px;
-                  border: 2px solid #0b57d0;
-                  border-radius: 999px;
-                  background: rgba(11, 87, 208, 0.12);
-                  box-shadow: 0 0 0 6px rgba(11, 87, 208, 0.08);
-                }
-              </style>
-              <div class="hm-trail"></div>
-              <div class="hm-cursor"></div>
-            `;
-
-            document.documentElement.append(root);
-        }""",
-        OVERLAY_ROOT_ID,
-    )
-
-
-def _clear_overlay(page: Page) -> None:
-    page.evaluate(
-        """overlayId => {
-            const root = document.getElementById(overlayId);
-            if (!root) {
-                return;
-            }
-
-            const trail = root.querySelector(".hm-trail");
-            const cursor = root.querySelector(".hm-cursor");
-            if (trail) {
-                trail.replaceChildren();
-            }
-            if (cursor) {
-                cursor.style.left = "0px";
-                cursor.style.top = "0px";
-                cursor.style.opacity = "0";
-            }
-        }""",
-        OVERLAY_ROOT_ID,
-    )
-
-
-def _update_overlay(page: Page, x: int, y: int) -> None:
-    page.evaluate(
-        """({ overlayId, x, y }) => {
-            const root = document.getElementById(overlayId);
-            if (!root) {
-                return;
-            }
-
-            const trail = root.querySelector(".hm-trail");
-            const cursor = root.querySelector(".hm-cursor");
-            if (trail) {
-                const dot = document.createElement("div");
-                dot.className = "hm-dot";
-                dot.style.left = `${x}px`;
-                dot.style.top = `${y}px`;
-                trail.append(dot);
-            }
-            if (cursor) {
-                cursor.style.left = `${x}px`;
-                cursor.style.top = `${y}px`;
-                cursor.style.opacity = "1";
-            }
-        }""",
-        {"overlayId": OVERLAY_ROOT_ID, "x": x, "y": y},
-    )
-
-
-def replay_track(
+async def replay_track(
     page: Page,
-    track: list[dict[str, int]],
+    track_data: str | list[dict[str, Any]],
     *,
     recorded_viewport: dict[str, Any] | None = None,
     scale_to_viewport: bool = True,
     initial_delay_ms: int = 0,
-    show_overlay: bool = True,
-    overlay_interval_ms: int = 16,
+    on_move: Callable[[int, int, int], Awaitable[None]] | None = None,
+    apply_trim: bool = True,
+    apply_noise: bool = True,
+    apply_rotation: bool = True,
 ) -> int:
+    """
+    Воспроизводит записанную траекторию движения мыши на указанной странице Playwright.
+
+    Аргументы:
+        page: Экземпляр асинхронной страницы Playwright (Page), на которой будет воспроизведен трек.
+        track_data: Строка JSON или список словарей, представляющих события мыши.
+            Каждое событие должно содержать 't' (временная метка), а также координаты 'x' и 'y'.
+        recorded_viewport: Словарь, содержащий 'width' (ширину) и 'height' (высоту)
+            области просмотра, в которой изначально был записан трек.
+        scale_to_viewport: Если True, масштабирует записанные координаты в соответствии с текущим
+            размером области просмотра. По умолчанию True.
+        initial_delay_ms: Количество миллисекунд для ожидания перед началом воспроизведения. По умолчанию 0.
+        on_move: Опциональная асинхронная функция обратного вызова, выполняемая при каждом движении мыши.
+            Она получает относительную временную метку, а также координаты x и y.
+        apply_trim: Включить обрезку трека (по умолчанию True).
+        apply_noise: Включить добавление микротремора (по умолчанию True).
+        apply_rotation: Включить случайный поворот трека (по умолчанию True).
+
+    Возвращает:
+        Количество успешно воспроизведенных событий мыши.
+    """
+    if isinstance(track_data, str):
+        track = json.loads(track_data)
+    else:
+        track = track_data
+
     if not track:
         return 0
 
-    target_width, target_height = _get_viewport_size(page)
+    if apply_trim:
+        track = _trim_track(track)
+    if apply_noise:
+        track = _add_noise_to_track(track)
+    if apply_rotation:
+        track = _rotate_track(track)
+
+    if not track:
+        return 0
+
+    target_width, target_height = await _get_viewport_size(page)
     source_width = int(recorded_viewport.get("width", target_width)) if recorded_viewport else target_width
     source_height = int(recorded_viewport.get("height", target_height)) if recorded_viewport else target_height
 
     scale_x = target_width / source_width if scale_to_viewport and source_width > 0 else 1.0
     scale_y = target_height / source_height if scale_to_viewport and source_height > 0 else 1.0
 
-    if show_overlay:
-        _ensure_overlay(page)
-        _clear_overlay(page)
-
     if initial_delay_ms > 0:
-        page.wait_for_timeout(initial_delay_ms)
+        await page.wait_for_timeout(initial_delay_ms)
 
     origin_time = int(track[0]["t"])
     started_at = time.perf_counter()
-    last_overlay_time = -overlay_interval_ms
 
     first_point = track[0]
     first_x = round(int(first_point["x"]) * scale_x)
     first_y = round(int(first_point["y"]) * scale_y)
-    page.mouse.move(
+    await page.mouse.move(
         first_x,
         first_y,
     )
-    if show_overlay:
-        _update_overlay(page, first_x, first_y)
-        last_overlay_time = 0
+    if on_move:
+        await on_move(0, first_x, first_y)
 
     replayed = 1
 
@@ -215,22 +172,13 @@ def replay_track(
         target_time = point_time / 1000.0
         remaining = target_time - (time.perf_counter() - started_at)
         if remaining > 0:
-            time.sleep(remaining)
+            await asyncio.sleep(remaining)
 
         current_x = round(int(point["x"]) * scale_x)
         current_y = round(int(point["y"]) * scale_y)
-        page.mouse.move(current_x, current_y)
-        if show_overlay and point_time - last_overlay_time >= overlay_interval_ms:
-            _update_overlay(page, current_x, current_y)
-            last_overlay_time = point_time
+        await page.mouse.move(current_x, current_y)
+        if on_move:
+            await on_move(point_time, current_x, current_y)
         replayed += 1
-
-    if show_overlay and last_overlay_time != int(track[-1]["t"]) - origin_time:
-        last_point = track[-1]
-        _update_overlay(
-            page,
-            round(int(last_point["x"]) * scale_x),
-            round(int(last_point["y"]) * scale_y),
-        )
 
     return replayed
